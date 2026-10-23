@@ -737,7 +737,9 @@ class KlineRepository:
                 logger.warning("enriched 即时计算失败, 使用原始 14 列缓存: %s", e)
 
             # 降级: 直接使用 14 列数据 + 构建 live_agg
-            self._enriched_cache = df_latest
+            # 必须与主路径 dtype 对齐: 实时落盘分区里的 amount 可能是 Int64,
+            # 主路径算出来的却是 Float64, 混用会让后续 pl.concat 抛 SchemaError。
+            self._enriched_cache = self._normalize_storage_dtypes(df_latest)
             self._enriched_cache_date = latest
             step = time.perf_counter()
             logger.info("enriched refresh fallback step start: build live agg")
@@ -1524,7 +1526,12 @@ class KlineRepository:
                         if not cached_part.is_empty():
                             df = df.filter(pl.col("date") != cache_date)
                             common_cols = [c for c in df.columns if c in cached_part.columns]
-                            df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+                            # diagonal_relaxed: 分区 schema 会漂移 (amount Int64 vs Float64),
+                            # strict concat 直接抛 SchemaError 导致 /api/kline/daily 500
+                            df = pl.concat(
+                                [df.select(common_cols), cached_part.select(common_cols)],
+                                how="diagonal_relaxed",
+                            )
                 return df
 
         # 扩展范围用于指标预热 (MA60 需要 ~60 交易日 ≈ 120 日历日)
@@ -1559,7 +1566,11 @@ class KlineRepository:
                 if not cached_part.is_empty():
                     df = df.filter(pl.col("date") != cache_date)
                     common_cols = [c for c in df.columns if c in cached_part.columns]
-                    df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+                    # 同快路径: 允许 schema 漂移 (amount Int64/Float64) 按 supertype 合并
+                    df = pl.concat(
+                        [df.select(common_cols), cached_part.select(common_cols)],
+                        how="diagonal_relaxed",
+                    )
 
         # 裁剪到请求范围
         if not df.is_empty():
@@ -1606,7 +1617,11 @@ class KlineRepository:
                 if not cached_part.is_empty():
                     df = df.filter(pl.col("date") != cache_date)
                     common_cols = [c for c in df.columns if c in cached_part.columns]
-                    df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+                    # 同 get_daily: 批量路径也会遇到 amount Int64/Float64 漂移
+                    df = pl.concat(
+                        [df.select(common_cols), cached_part.select(common_cols)],
+                        how="diagonal_relaxed",
+                    )
             if columns and not df.is_empty():
                 existing = [c for c in columns if c in df.columns]
                 df = df.select(existing)
@@ -1988,18 +2003,12 @@ class KlineRepository:
             return hist
         # 去重: 历史部分可能包含 cache_date, 去掉后再合并
         hist = hist.filter(pl.col("date") < cache_date)
-        # 对齐列: 取交集, 统一类型
+        # 对齐列: 取交集, 类型交给 diagonal_relaxed 按 supertype 提升
+        # (原实现按行数多少挑目标类型, 缓存行数多时会把 Float64 截成 Int64)
         common_cols = [c for c in hist.columns if c in cached_part.columns]
         hist = hist.select(common_cols)
         cached_part = cached_part.select(common_cols)
-        # 统一类型: 历史可能是 Float64, 缓存可能是 Int64, 统一为 cast
-        for c in common_cols:
-            if hist[c].dtype != cached_part[c].dtype:
-                # 统一到更宽的类型
-                target = hist[c].dtype if hist.height > cached_part.height else cached_part[c].dtype
-                hist = hist.with_columns(pl.col(c).cast(target))
-                cached_part = cached_part.with_columns(pl.col(c).cast(target))
-        return pl.concat([hist, cached_part])
+        return pl.concat([hist, cached_part], how="diagonal_relaxed")
 
     # ================================================================
     # DuckDB 查询 (冷路径: 统计/元数据/自定义SQL)
@@ -2164,7 +2173,7 @@ class KlineRepository:
             return
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
-        df_storage = df.select(storage_cols)
+        df_storage = self._normalize_storage_dtypes(df.select(storage_cols))
         self._write_daily_partition(df_storage, "kline_daily_enriched")
 
     def append_index_daily(self, df: pl.DataFrame) -> None:
@@ -2470,7 +2479,7 @@ class KlineRepository:
 
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
-        df_storage = df.select(storage_cols).sort(["symbol"])
+        df_storage = self._normalize_storage_dtypes(df.select(storage_cols)).sort(["symbol"])
         base = self.store.data_dir / table
         ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
         out = base / f"date={ds}" / "part.parquet"
@@ -2519,6 +2528,26 @@ class KlineRepository:
         with self._write_lock:
             self._atomic_write_parquet(df_sorted, out)
 
+    # 落盘数值列统一 Float64: 实时快照来的 amount 是整数, 批量管线是 Float64,
+    # 两条路径混写会让同一列在不同分区出现 Int64/Float64 漂移。
+    _STORAGE_FLOAT_COLS = (
+        "open", "high", "low", "close", "volume", "amount",
+        "raw_close", "raw_high", "raw_low", "turnover_rate",
+    )
+
+    @classmethod
+    def _normalize_storage_dtypes(cls, df: pl.DataFrame) -> pl.DataFrame:
+        """把存储数值列统一成 Float64, 消除分区间的 schema 漂移。"""
+        if df.is_empty():
+            return df
+        schema = df.schema
+        casts = [
+            pl.col(c).cast(pl.Float64)
+            for c in cls._STORAGE_FLOAT_COLS
+            if c in schema and schema[c] != pl.Float64
+        ]
+        return df.with_columns(casts) if casts else df
+
     def flush_live_enriched(self, df: pl.DataFrame) -> None:
         """覆写当天 kline_daily_enriched 分区 (实时 enriched 落盘, 非merge)。
 
@@ -2531,7 +2560,9 @@ class KlineRepository:
         if df.is_empty() or "date" not in df.columns:
             return
         dt = df["date"][0]
-        cache_df = self._with_instrument_metadata(asset_type, df).sort(["symbol"])
+        cache_df = self._normalize_storage_dtypes(
+            self._with_instrument_metadata(asset_type, df)
+        ).sort(["symbol"])
         if asset_type == "stock":
             table = "kline_daily_enriched"
         elif asset_type == "etf":
@@ -2543,7 +2574,7 @@ class KlineRepository:
 
         from app.indicators.pipeline import ENRICHED_STORAGE_COLS
         storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
-        df_storage = df.select(storage_cols).sort(["symbol"])
+        df_storage = self._normalize_storage_dtypes(df.select(storage_cols)).sort(["symbol"])
         base = self.store.data_dir / table
         ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
         out = base / f"date={ds}" / "part.parquet"
